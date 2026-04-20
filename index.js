@@ -108,6 +108,8 @@ var qvariation = 10;
 if(new URLSearchParams(window.location.search).get('v')){qvariation = parseInt(new URLSearchParams(window.location.search).get('v'))}; //cell size variation
 var qdepthvariation = 5;
 if(new URLSearchParams(window.location.search).get('dv')){qdepthvariation = parseInt(new URLSearchParams(window.location.search).get('dv'))}; //depth variation
+var qstyle = R.random_choice(["Full","Towers","Split"]);
+if(new URLSearchParams(window.location.search).get('st')){qstyle = new URLSearchParams(window.location.search).get('st')}; //style
 
 var qorientation =R.random_int(1,2) < 2 ? "portrait" : "landscape";
 var qframecolor = R.random_int(0,3) < 1 ? "White" : R.random_int(1,3) < 2 ? "Mocha" : "Random";     
@@ -219,6 +221,13 @@ definitions = [
             max: 10,
             step: 1,
         },
+    },
+    {
+        id: "style",
+        name: "Style",
+        type: "select",
+        default: qstyle,
+        options: {options: ["Full","Towers","Split"]},
     },
     {
         id: "matwidth",
@@ -362,9 +371,10 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return out;
         }
 
-        // Voronoi cell of site idx, clipped to bbox. Relaxation-only.
-        function computeVoronoiCell(idx, siteList) {
-            var cell = [
+        // Voronoi cell of site idx, clipped to the given starting region
+        // (defaults to the full drawing bbox). Relaxation-only.
+        function computeVoronoiCell(idx, siteList, startRegion) {
+            var cell = startRegion ? startRegion.slice() : [
                 {x: bbox.minX, y: bbox.minY},
                 {x: bbox.maxX, y: bbox.minY},
                 {x: bbox.maxX, y: bbox.maxY},
@@ -506,92 +516,273 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return out;
         }
 
-        // Seed sites (deterministic)
-        var sites = [];
-        for (var si = 0; si < numSites; si++) {
-            sites.push({
-                x: bbox.minX + R.random_dec() * (bbox.maxX - bbox.minX),
-                y: bbox.minY + R.random_dec() * (bbox.maxY - bbox.minY)
-            });
-        }
-
-        // Partial Lloyd's relaxation on the Voronoi dual — uniform points
-        // produce uniform triangles after retriangulating.
-        // variation 1 = full relaxation (even triangles), 10 = minimal
-        // relaxation (nearly raw random distribution = significant size variation).
-        var variation = $fx.getParam('variation');
-        var variationT = (variation - 1) / 9; // 0..1
-        var blend = 1.0 - variationT * 0.96; // 1.0 at v=1, 0.04 at v=10
-        var relaxIters = 4;
-        for (var iter = 0; iter < relaxIters; iter++) {
-            var relaxed = [];
-            for (var i = 0; i < sites.length; i++) {
-                var vc = computeVoronoiCell(i, sites);
-                if (!vc) { relaxed.push(sites[i]); continue; }
-                var cc = polygonCentroid(vc);
-                if (!cc) { relaxed.push(sites[i]); continue; }
-                relaxed.push({
-                    x: sites[i].x + (cc.x - sites[i].x) * blend,
-                    y: sites[i].y + (cc.y - sites[i].y) * blend
-                });
+        // --- Region helpers: each style produces a list of convex region polygons
+        //     inside which one independent Delaunay triangulation will be built.
+        function polygonSignedArea(poly) {
+            var a = 0;
+            for (var i = 0; i < poly.length; i++) {
+                var p = poly[i], q = poly[(i+1) % poly.length];
+                a += p.x * q.y - q.x * p.y;
             }
-            sites = relaxed;
+            return a * 0.5;
+        }
+        function polygonArea(poly) { return Math.abs(polygonSignedArea(poly)); }
+        function polygonBBox(poly) {
+            var nX = Infinity, nY = Infinity, xX = -Infinity, xY = -Infinity;
+            for (var i = 0; i < poly.length; i++) {
+                if (poly[i].x < nX) nX = poly[i].x;
+                if (poly[i].y < nY) nY = poly[i].y;
+                if (poly[i].x > xX) xX = poly[i].x;
+                if (poly[i].y > xY) xY = poly[i].y;
+            }
+            return {minX: nX, minY: nY, maxX: xX, maxY: xY};
+        }
+        function pointInConvexPolygon(pt, poly) {
+            // Assumes CCW winding.
+            for (var i = 0; i < poly.length; i++) {
+                var a = poly[i], b = poly[(i+1) % poly.length];
+                var cross = (b.x - a.x) * (pt.y - a.y) - (b.y - a.y) * (pt.x - a.x);
+                if (cross < 0) return false;
+            }
+            return true;
+        }
+        // Clip convex poly against convex region by successive half-plane clips.
+        function clipPolygonToConvex(poly, region) {
+            var clipped = poly;
+            for (var i = 0; i < region.length; i++) {
+                var a = region[i], b = region[(i+1) % region.length];
+                var dxE = b.x - a.x, dyE = b.y - a.y;
+                // CCW region: inside is to the left of each edge. clipHalfPlane
+                // keeps (p-m).d <= 0, so pass the right-pointing normal (dy, -dx).
+                clipped = clipHalfPlane(clipped, a.x, a.y, dyE, -dxE);
+                if (clipped.length < 3) return null;
+            }
+            return clipped;
         }
 
-        // Triangulate the relaxed point set.
-        var triangles = delaunayTriangulate(sites);
+        // Larger gap so discrete regions read as separate elements; most of the
+        // visual breathing room now also comes from the organic convex hull
+        // (interior sites never reach region boundaries).
+        var regionGap = minOffset * 4;
+        function buildRegions(style) {
+            var bw = bbox.maxX - bbox.minX, bh = bbox.maxY - bbox.minY;
+            var cx = (bbox.minX + bbox.maxX) / 2;
+            var cy = (bbox.minY + bbox.maxY) / 2;
+            var regions = [];
 
-        // Depth variation — 1 centers every triangle at mid-depth,
-        // 10 lets the noise field span the full layer range.
+            function R_(poly, lockVerts) {
+                return { poly: poly, lockVerts: lockVerts || [] };
+            }
+
+            if (style === 'Towers') {
+                var numTowers = R.random_int(3, 10);
+                var alignment = R.random_choice(['top','bottom','left','right']);
+                var horiz = (alignment === 'top' || alignment === 'bottom');
+                var slot = (horiz ? bw : bh) / numTowers;
+                var gap = regionGap * 0.5;
+                for (var i = 0; i < numTowers; i++) {
+                    var extent = (horiz ? bh : bw);
+                    var len = extent * (0.35 + R.random_dec() * 0.65);
+                    if (horiz) {
+                        var x0 = bbox.minX + i * slot + gap;
+                        var x1 = bbox.minX + (i+1) * slot - gap;
+                        var y0, y1, lock;
+                        if (alignment === 'bottom') {
+                            y1 = bbox.maxY; y0 = y1 - len;
+                            lock = [2, 3]; // (x1,y1) and (x0,y1) — bottom edge flush
+                        } else {
+                            y0 = bbox.minY; y1 = y0 + len;
+                            lock = [0, 1]; // (x0,y0) and (x1,y0) — top edge flush
+                        }
+                        if (x1 - x0 < regionGap) continue;
+                        regions.push(R_([{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}], lock));
+                    } else {
+                        var y0v = bbox.minY + i * slot + gap;
+                        var y1v = bbox.minY + (i+1) * slot - gap;
+                        var x0v, x1v, lockV;
+                        if (alignment === 'left') {
+                            x0v = bbox.minX; x1v = x0v + len;
+                            lockV = [0, 3]; // (x0v,y0v) and (x0v,y1v) — left edge flush
+                        } else {
+                            x1v = bbox.maxX; x0v = x1v - len;
+                            lockV = [1, 2]; // (x1v,y0v) and (x1v,y1v) — right edge flush
+                        }
+                        if (y1v - y0v < regionGap) continue;
+                        regions.push(R_([{x:x0v,y:y0v},{x:x1v,y:y0v},{x:x1v,y:y1v},{x:x0v,y:y1v}], lockV));
+                    }
+                }
+            } else if (style === 'Split') {
+                var splitCount = R.random_choice([2,4]);
+                var splitStyle = R.random_choice(['diagonal','axis']);
+                var g = regionGap * 0.5;
+
+                if (splitCount === 2 && splitStyle === 'diagonal') {
+                    var diag = R.random_int(0,1);
+                    if (diag === 0) { // TL-BR diagonal
+                        regions.push(R_([{x:bbox.minX+g,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:bbox.maxY-g}]));
+                        regions.push(R_([{x:bbox.minX,y:bbox.minY+g},{x:bbox.maxX-g,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}]));
+                    } else {          // TR-BL diagonal
+                        regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:bbox.maxX-g,y:bbox.minY},{x:bbox.minX,y:bbox.maxY-g}]));
+                        regions.push(R_([{x:bbox.maxX,y:bbox.minY+g},{x:bbox.maxX,y:bbox.maxY},{x:bbox.minX+g,y:bbox.maxY}]));
+                    }
+                } else if (splitCount === 2) { // axis
+                    if (R.random_int(0,1) === 0) { // vertical split
+                        regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:cx-g,y:bbox.minY},{x:cx-g,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}]));
+                        regions.push(R_([{x:cx+g,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:bbox.maxY},{x:cx+g,y:bbox.maxY}]));
+                    } else { // horizontal split
+                        regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:cy-g},{x:bbox.minX,y:cy-g}]));
+                        regions.push(R_([{x:bbox.minX,y:cy+g},{x:bbox.maxX,y:cy+g},{x:bbox.maxX,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}]));
+                    }
+                } else if (splitCount === 4 && splitStyle === 'diagonal') {
+                    // X split — four triangles meeting near center, each pulled in by g.
+                    regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:cx,y:cy-g}]));
+                    regions.push(R_([{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:bbox.maxY},{x:cx+g,y:cy}]));
+                    regions.push(R_([{x:bbox.maxX,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY},{x:cx,y:cy+g}]));
+                    regions.push(R_([{x:bbox.minX,y:bbox.maxY},{x:bbox.minX,y:bbox.minY},{x:cx-g,y:cy}]));
+                } else {
+                    // Four axis-aligned quadrants.
+                    regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:cx-g,y:bbox.minY},{x:cx-g,y:cy-g},{x:bbox.minX,y:cy-g}]));
+                    regions.push(R_([{x:cx+g,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:cy-g},{x:cx+g,y:cy-g}]));
+                    regions.push(R_([{x:cx+g,y:cy+g},{x:bbox.maxX,y:cy+g},{x:bbox.maxX,y:bbox.maxY},{x:cx+g,y:bbox.maxY}]));
+                    regions.push(R_([{x:bbox.minX,y:cy+g},{x:cx-g,y:cy+g},{x:cx-g,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}]));
+                }
+            } else { // Full
+                regions.push(R_([
+                    {x:bbox.minX,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},
+                    {x:bbox.maxX,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}
+                ]));
+            }
+
+            // Polys we construct are already CCW (verified), but re-winding the
+            // poly would invalidate lockVerts indices — so skip ensureCCW here.
+            return regions;
+        }
+
+        var styleParam = $fx.getParam('style');
+        var regions = buildRegions(styleParam);
+        console.log('Style: ' + styleParam + ' / regions: ' + regions.length);
+
+        var regionAreas = new Array(regions.length);
+        var totalRegionArea = 0;
+        for (var ri = 0; ri < regions.length; ri++) {
+            regionAreas[ri] = polygonArea(regions[ri].poly);
+            totalRegionArea += regionAreas[ri];
+        }
+
+        // Shared driver knobs.
+        var variation = $fx.getParam('variation');
+        var variationT = (variation - 1) / 9;
+        var blend = 1.0 - variationT * 0.96;
+        var relaxIters = 4;
+
         var depthVariation = $fx.getParam('depthvariation');
-        var depthVarT = (depthVariation - 1) / 9; // 0..1
+        var depthVarT = (depthVariation - 1) / 9;
         var firstVoronoiLayer = stacks - 1; // every layer participates in the triangulation
         var fullMaxDepth = firstVoronoiLayer;
         var fullMinDepth = Math.min(5, fullMaxDepth);
         var midDepth = (fullMinDepth + fullMaxDepth) / 2;
         var halfRange = (fullMaxDepth - fullMinDepth) / 2 * depthVarT;
 
-        // Each triangle becomes a cell with the same shape the renderer expects.
         var cells = [];
-        for (var ti = 0; ti < triangles.length; ti++) {
-            var tri = triangles[ti];
-            var p1 = sites[tri[0]], p2 = sites[tri[1]], p3 = sites[tri[2]];
 
-            // CCW winding for Clipper offset.
-            var signedArea = (p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y);
-            var polygon = signedArea >= 0 ? [p1, p2, p3] : [p1, p3, p2];
+        for (var ri = 0; ri < regions.length; ri++) {
+            var region = regions[ri].poly;
+            var lockVerts = regions[ri].lockVerts;
+            var rbbox = polygonBBox(region);
 
-            // Inradius = area / semi-perimeter (drives per-layer inset growth).
-            var ax = polygon[0].x, ay = polygon[0].y;
-            var bx = polygon[1].x, by = polygon[1].y;
-            var cx = polygon[2].x, cy = polygon[2].y;
-            var la = Math.hypot(bx - cx, by - cy);
-            var lb = Math.hypot(ax - cx, ay - cy);
-            var lc = Math.hypot(ax - bx, ay - by);
-            var sp = (la + lb + lc) * 0.5;
-            var area = Math.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) * 0.5;
-            var inradius = Math.max(1, sp > 1e-6 ? area / sp : 1);
+            // Region's share of the global site budget, proportional to area.
+            var interiorTarget = Math.max(4, Math.round(numSites * regionAreas[ri] / totalRegionArea));
 
-            // Per-cell depth from spatially coherent Perlin noise.
-            var centroidX = (ax + bx + cx) / 3;
-            var centroidY = (ay + by + cy) / 3;
-            var depthNoise = noise.get(centroidX * prange * 0.6, centroidY * prange * 0.6);
-            if (depthNoise < 0) depthNoise = 0;
-            if (depthNoise > 1) depthNoise = 1;
-            var minDepth = Math.max(1, Math.round(midDepth - halfRange));
-            var maxDepth = Math.max(minDepth, Math.round(midDepth + halfRange));
-            var depth = minDepth + Math.floor(depthNoise * (maxDepth - minDepth + 1));
-            if (depth > fullMaxDepth) depth = fullMaxDepth;
-            if (depth < 1) depth = 1;
+            // Only lock the explicitly-aligned vertices (e.g. a tower's aligned
+            // edge). The remaining boundary stays organic — the convex hull of
+            // interior sites pulls inward, giving the triangulation an irregular
+            // outline instead of snapping to the region rectangle/triangle.
+            var sites = [];
+            for (var lv = 0; lv < lockVerts.length; lv++) {
+                var vi = lockVerts[lv];
+                sites.push({x: region[vi].x, y: region[vi].y, locked: true});
+            }
 
-            var endLayer = firstVoronoiLayer - (depth - 1);
-            if (endLayer < 1) endLayer = 1;
+            // Rejection-sample interior sites inside the region polygon.
+            var attempts = 0;
+            var maxAttempts = interiorTarget * 50 + 100;
+            var lockedCount = sites.length;
+            while (sites.length - lockedCount < interiorTarget && attempts < maxAttempts) {
+                var sx = rbbox.minX + R.random_dec() * (rbbox.maxX - rbbox.minX);
+                var sy = rbbox.minY + R.random_dec() * (rbbox.maxY - rbbox.minY);
+                if (pointInConvexPolygon({x: sx, y: sy}, region)) {
+                    sites.push({x: sx, y: sy});
+                }
+                attempts++;
+            }
+            if (sites.length < 3) continue;
 
-            cells.push({
-                polygon: polygon,
-                inradius: inradius,
-                endLayer: endLayer
-            });
+            // Lloyd's relaxation on interior sites only — corners stay pinned.
+            for (var iter = 0; iter < relaxIters; iter++) {
+                var relaxed = [];
+                for (var i = 0; i < sites.length; i++) {
+                    if (sites[i].locked) { relaxed.push(sites[i]); continue; }
+                    var vc = computeVoronoiCell(i, sites, region);
+                    if (!vc) { relaxed.push(sites[i]); continue; }
+                    var cc = polygonCentroid(vc);
+                    if (!cc) { relaxed.push(sites[i]); continue; }
+                    relaxed.push({
+                        x: sites[i].x + (cc.x - sites[i].x) * blend,
+                        y: sites[i].y + (cc.y - sites[i].y) * blend
+                    });
+                }
+                sites = relaxed;
+            }
+
+            var triangles = delaunayTriangulate(sites);
+
+            for (var ti = 0; ti < triangles.length; ti++) {
+                var tri = triangles[ti];
+                var p1 = sites[tri[0]], p2 = sites[tri[1]], p3 = sites[tri[2]];
+
+                var signedArea = (p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y);
+                var triPoly = signedArea >= 0 ? [p1, p2, p3] : [p1, p3, p2];
+
+                // Reject triangles whose centroid falls outside the region — can
+                // happen along a non-axis-aligned region edge if the convex hull
+                // of sites overshoots. Then clip to the region for safety.
+                var centroidX0 = (triPoly[0].x + triPoly[1].x + triPoly[2].x) / 3;
+                var centroidY0 = (triPoly[0].y + triPoly[1].y + triPoly[2].y) / 3;
+                if (!pointInConvexPolygon({x: centroidX0, y: centroidY0}, region)) continue;
+
+                var polygon = clipPolygonToConvex(triPoly, region);
+                if (!polygon || polygon.length < 3) continue;
+
+                // Inradius via 2*area/perimeter (exact for triangles, reasonable
+                // scale for any clipped convex polygon).
+                var area = polygonArea(polygon);
+                var perim = 0;
+                for (var pi2 = 0; pi2 < polygon.length; pi2++) {
+                    var pa = polygon[pi2], pb = polygon[(pi2+1) % polygon.length];
+                    perim += Math.hypot(pb.x - pa.x, pb.y - pa.y);
+                }
+                var inradius = Math.max(1, perim > 1e-6 ? 2 * area / perim : 1);
+
+                // Per-cell depth from spatially coherent Perlin noise.
+                var centroid = polygonCentroid(polygon) || {x: centroidX0, y: centroidY0};
+                var depthNoise = noise.get(centroid.x * prange * 0.6, centroid.y * prange * 0.6);
+                if (depthNoise < 0) depthNoise = 0;
+                if (depthNoise > 1) depthNoise = 1;
+                var minDepth = Math.max(1, Math.round(midDepth - halfRange));
+                var maxDepth = Math.max(minDepth, Math.round(midDepth + halfRange));
+                var depth = minDepth + Math.floor(depthNoise * (maxDepth - minDepth + 1));
+                if (depth > fullMaxDepth) depth = fullMaxDepth;
+                if (depth < 1) depth = 1;
+
+                var endLayer = firstVoronoiLayer - (depth - 1);
+                if (endLayer < 1) endLayer = 1;
+
+                cells.push({
+                    polygon: polygon,
+                    inradius: inradius,
+                    endLayer: endLayer
+                });
+            }
         }
         console.log('Delaunay triangles: ' + cells.length);
 
