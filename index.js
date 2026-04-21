@@ -566,6 +566,36 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return clipped;
         }
 
+        // Inset every edge of a CCW convex polygon inward by `insetDist`,
+        // EXCEPT edges whose two endpoints are both listed in lockVerts (those
+        // stay flush — used for a tower's aligned edge). Returns the inset
+        // polygon, or the original if the inset collapses it.
+        //
+        // This is what anchors the triangulation to a consistent hull size at
+        // all densities: without this, low density = few sites clustered near
+        // the middle of the region = small hull = lots of empty canvas.
+        function effectiveRegionFor(poly, lockVerts, insetDist) {
+            var lockedSet = {};
+            for (var li = 0; li < lockVerts.length; li++) lockedSet[lockVerts[li]] = true;
+            var effective = poly.slice();
+            for (var i = 0; i < poly.length; i++) {
+                var v1 = i, v2 = (i + 1) % poly.length;
+                if (lockedSet[v1] && lockedSet[v2]) continue; // keep edge flush
+                var a = poly[v1], b = poly[v2];
+                var dxE = b.x - a.x, dyE = b.y - a.y;
+                var len = Math.hypot(dxE, dyE);
+                if (len < 1e-6) continue;
+                // Inward normal for CCW poly (left of edge).
+                var nx = -dyE / len, ny = dxE / len;
+                var mx = a.x + nx * insetDist;
+                var my = a.y + ny * insetDist;
+                // Keep points inward of the moved edge: (p - m) . (-nx, -ny) <= 0.
+                effective = clipHalfPlane(effective, mx, my, -nx, -ny);
+                if (effective.length < 3) return poly;
+            }
+            return effective;
+        }
+
         // Larger gap so discrete regions read as separate elements; most of the
         // visual breathing room now also comes from the organic convex hull
         // (interior sites never reach region boundaries).
@@ -703,41 +733,48 @@ var px=0;var py=0;var pz=0;var prange=.1;
         for (var ri = 0; ri < regions.length; ri++) {
             var region = regions[ri].poly;
             var lockVerts = regions[ri].lockVerts;
-            var rbbox = polygonBBox(region);
+
+            // Inset non-locked edges to define a consistent hull size. Locked
+            // edges (towers' aligned edge) stay flush with the frame.
+            // Inset scales with the region's short dimension so small regions
+            // (thin towers) don't collapse, with a floor of minOffset * 4.
+            var rOuter = polygonBBox(region);
+            var rShort = Math.min(rOuter.maxX - rOuter.minX, rOuter.maxY - rOuter.minY);
+            var organicInset = Math.max(minOffset * 4, rShort * 0.1);
+            var effRegion = effectiveRegionFor(region, lockVerts, organicInset);
+            var rbbox = polygonBBox(effRegion);
 
             // Region's share of the global site budget, proportional to area.
             var interiorTarget = Math.max(4, Math.round(numSites * regionAreas[ri] / totalRegionArea));
 
-            // Only lock the explicitly-aligned vertices (e.g. a tower's aligned
-            // edge). The remaining boundary stays organic — the convex hull of
-            // interior sites pulls inward, giving the triangulation an irregular
-            // outline instead of snapping to the region rectangle/triangle.
+            // Lock every vertex of the inset region — this pins the triangulation's
+            // convex hull to a known, density-independent shape, so low-density
+            // outputs fill the same canvas area as high-density ones.
             var sites = [];
-            for (var lv = 0; lv < lockVerts.length; lv++) {
-                var vi = lockVerts[lv];
-                sites.push({x: region[vi].x, y: region[vi].y, locked: true});
+            for (var v = 0; v < effRegion.length; v++) {
+                sites.push({x: effRegion[v].x, y: effRegion[v].y, locked: true});
             }
 
-            // Rejection-sample interior sites inside the region polygon.
+            // Rejection-sample interior sites inside the inset region.
             var attempts = 0;
             var maxAttempts = interiorTarget * 50 + 100;
             var lockedCount = sites.length;
             while (sites.length - lockedCount < interiorTarget && attempts < maxAttempts) {
                 var sx = rbbox.minX + R.random_dec() * (rbbox.maxX - rbbox.minX);
                 var sy = rbbox.minY + R.random_dec() * (rbbox.maxY - rbbox.minY);
-                if (pointInConvexPolygon({x: sx, y: sy}, region)) {
+                if (pointInConvexPolygon({x: sx, y: sy}, effRegion)) {
                     sites.push({x: sx, y: sy});
                 }
                 attempts++;
             }
             if (sites.length < 3) continue;
 
-            // Lloyd's relaxation on interior sites only — corners stay pinned.
+            // Lloyd's relaxation on interior sites only — anchors stay pinned.
             for (var iter = 0; iter < relaxIters; iter++) {
                 var relaxed = [];
                 for (var i = 0; i < sites.length; i++) {
                     if (sites[i].locked) { relaxed.push(sites[i]); continue; }
-                    var vc = computeVoronoiCell(i, sites, region);
+                    var vc = computeVoronoiCell(i, sites, effRegion);
                     if (!vc) { relaxed.push(sites[i]); continue; }
                     var cc = polygonCentroid(vc);
                     if (!cc) { relaxed.push(sites[i]); continue; }
@@ -763,9 +800,9 @@ var px=0;var py=0;var pz=0;var prange=.1;
                 // of sites overshoots. Then clip to the region for safety.
                 var centroidX0 = (triPoly[0].x + triPoly[1].x + triPoly[2].x) / 3;
                 var centroidY0 = (triPoly[0].y + triPoly[1].y + triPoly[2].y) / 3;
-                if (!pointInConvexPolygon({x: centroidX0, y: centroidY0}, region)) continue;
+                if (!pointInConvexPolygon({x: centroidX0, y: centroidY0}, effRegion)) continue;
 
-                var polygon = clipPolygonToConvex(triPoly, region);
+                var polygon = clipPolygonToConvex(triPoly, effRegion);
                 if (!polygon || polygon.length < 3) continue;
 
                 // Inradius via 2*area/perimeter (exact for triangles, reasonable
