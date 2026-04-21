@@ -566,34 +566,86 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return clipped;
         }
 
-        // Inset every edge of a CCW convex polygon inward by `insetDist`,
-        // EXCEPT edges whose two endpoints are both listed in lockVerts (those
-        // stay flush — used for a tower's aligned edge). Returns the inset
-        // polygon, or the original if the inset collapses it.
-        //
-        // This is what anchors the triangulation to a consistent hull size at
-        // all densities: without this, low density = few sites clustered near
-        // the middle of the region = small hull = lots of empty canvas.
-        function effectiveRegionFor(poly, lockVerts, insetDist) {
+        // Inset every edge of a CCW convex polygon inward by `insetDist`.
+        // Edges between two lockVerts are treated specially: their inset is
+        // scaled by lockedScale (0 = fully flush; small positive = slight
+        // inset so the edge still participates in the organic hull outline).
+        function effectiveRegionFor(poly, lockVerts, insetDist, lockedScale) {
             var lockedSet = {};
             for (var li = 0; li < lockVerts.length; li++) lockedSet[lockVerts[li]] = true;
+            var lockedInset = insetDist * (lockedScale || 0);
             var effective = poly.slice();
             for (var i = 0; i < poly.length; i++) {
                 var v1 = i, v2 = (i + 1) % poly.length;
-                if (lockedSet[v1] && lockedSet[v2]) continue; // keep edge flush
+                var edgeLocked = lockedSet[v1] && lockedSet[v2];
+                var useInset = edgeLocked ? lockedInset : insetDist;
+                if (useInset <= 0) continue;
                 var a = poly[v1], b = poly[v2];
                 var dxE = b.x - a.x, dyE = b.y - a.y;
                 var len = Math.hypot(dxE, dyE);
                 if (len < 1e-6) continue;
-                // Inward normal for CCW poly (left of edge).
                 var nx = -dyE / len, ny = dxE / len;
-                var mx = a.x + nx * insetDist;
-                var my = a.y + ny * insetDist;
-                // Keep points inward of the moved edge: (p - m) . (-nx, -ny) <= 0.
+                var mx = a.x + nx * useInset;
+                var my = a.y + ny * useInset;
                 effective = clipHalfPlane(effective, mx, my, -nx, -ny);
                 if (effective.length < 3) return poly;
             }
             return effective;
+        }
+
+        // Places locked "hull anchor" sites along each edge at jittered
+        // tangent positions AND jittered inward offsets. The convex hull of
+        // the anchors forms an irregular polygon roughly insetDist inside the
+        // region — this keeps the triangulation outline organic (not a clean
+        // rectangle) while the average inset keeps canvas fill consistent.
+        //
+        // For edges where both endpoints are in lockVerts, the inset base is
+        // scaled by `lockedScale` (0 = anchors flush on the edge, small
+        // positive = anchors slightly inset so the edge still has organic
+        // variation). Corner lockVerts are always added flush.
+        function generateHullAnchors(poly, lockVerts, insetDist, anchorsPerEdge, lockedScale) {
+            var lockedSet = {};
+            for (var li = 0; li < lockVerts.length; li++) lockedSet[lockVerts[li]] = true;
+            var scale = (lockedScale || 0);
+            var anchors = [];
+            // Only pin lockVerts corners when the edge is hard-locked (scale=0).
+            // With soft locks, letting the corner float lets adjacent edge
+            // anchors form an organic cut-corner where two locked edges meet
+            // — otherwise the hull snaps to the exact corner point and looks
+            // rigid (a sharp + at the center of a 4-axis split).
+            if (scale === 0) {
+                for (var lv = 0; lv < lockVerts.length; lv++) {
+                    var vi = lockVerts[lv];
+                    anchors.push({x: poly[vi].x, y: poly[vi].y, locked: true});
+                }
+            }
+            for (var i = 0; i < poly.length; i++) {
+                var v1 = i, v2 = (i + 1) % poly.length;
+                var a = poly[v1], b = poly[v2];
+                var edgeLocked = (lockedSet[v1] && lockedSet[v2]);
+                var edgeBase = edgeLocked ? insetDist * scale : insetDist;
+                var dxE = b.x - a.x, dyE = b.y - a.y;
+                var len = Math.hypot(dxE, dyE);
+                if (len < 1e-6) continue;
+                var nx = -dyE / len, ny = dxE / len; // inward normal for CCW poly
+                for (var k = 0; k < anchorsPerEdge; k++) {
+                    var baseT = (k + 1) / (anchorsPerEdge + 1);
+                    // Keep jitter below the slot size so adjacent anchors on
+                    // the same edge can't swap or cluster into a sliver.
+                    var t = baseT + (R.random_dec() - 0.5) * 0.4 / (anchorsPerEdge + 1);
+                    t = Math.max(0.08, Math.min(0.92, t));
+                    var px = a.x + dxE * t;
+                    var py = a.y + dyE * t;
+                    // Inset jitter: 0.4x..1.4x of the edge's base inset.
+                    var insetPx = edgeBase * (0.4 + R.random_dec());
+                    anchors.push({
+                        x: px + nx * insetPx,
+                        y: py + ny * insetPx,
+                        locked: true
+                    });
+                }
+            }
+            return anchors;
         }
 
         // Larger gap so discrete regions read as separate elements; most of the
@@ -606,17 +658,28 @@ var px=0;var py=0;var pz=0;var prange=.1;
             var cy = (bbox.minY + bbox.maxY) / 2;
             var regions = [];
 
-            function R_(poly, lockVerts) {
-                return { poly: poly, lockVerts: lockVerts || [] };
+            function R_(poly, lockVerts, lockedScale) {
+                return {
+                    poly: poly,
+                    lockVerts: lockVerts || [],
+                    lockedScale: lockedScale || 0, // 0 = locked edges flush; >0 = subtle organic inset
+                };
             }
 
             if (style === 'Towers') {
-                var numTowers = R.random_int(3, 10);
-                var alignment = R.random_choice(['top','bottom','left','right']);
-                var horiz = (alignment === 'top' || alignment === 'bottom');
+                var numTowers = R.random_int(2, 6);
+                // Pick an axis (horizontal = top/bottom edges; vertical = left/right).
+                // Sometimes all towers share one edge (uniform skyline); sometimes
+                // each tower independently picks either of the two opposite edges
+                // (mixed — stalactites and stalagmites).
+                var horiz = R.random_int(0, 1) === 0;
+                var edgeOpts = horiz ? ['bottom','top'] : ['left','right'];
+                var mixedAlign = R.random_int(0, 1) === 0; // 50% mixed, 50% uniform
+                var fixedAlign = R.random_choice(edgeOpts);
                 var slot = (horiz ? bw : bh) / numTowers;
                 var gap = regionGap * 0.5;
                 for (var i = 0; i < numTowers; i++) {
+                    var alignment = mixedAlign ? R.random_choice(edgeOpts) : fixedAlign;
                     var extent = (horiz ? bh : bw);
                     var len = extent * (0.35 + R.random_dec() * 0.65);
                     if (horiz) {
@@ -676,11 +739,16 @@ var px=0;var py=0;var pz=0;var prange=.1;
                     regions.push(R_([{x:bbox.maxX,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY},{x:cx,y:cy+g}]));
                     regions.push(R_([{x:bbox.minX,y:bbox.maxY},{x:bbox.minX,y:bbox.minY},{x:cx-g,y:cy}]));
                 } else {
-                    // Four axis-aligned quadrants.
-                    regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:cx-g,y:bbox.minY},{x:cx-g,y:cy-g},{x:bbox.minX,y:cy-g}]));
-                    regions.push(R_([{x:cx+g,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:cy-g},{x:cx+g,y:cy-g}]));
-                    regions.push(R_([{x:cx+g,y:cy+g},{x:bbox.maxX,y:cy+g},{x:bbox.maxX,y:bbox.maxY},{x:cx+g,y:bbox.maxY}]));
-                    regions.push(R_([{x:bbox.minX,y:cy+g},{x:cx-g,y:cy+g},{x:cx-g,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}]));
+                    // Four axis-aligned quadrants. Center-facing edges lock
+                    // their endpoints and use a small lockedScale so their
+                    // anchors are only slightly inset — the quadrants stay
+                    // close to center, but the inner boundary is organic
+                    // rather than a perfectly straight +.
+                    var qScale = 0.3;
+                    regions.push(R_([{x:bbox.minX,y:bbox.minY},{x:cx-g,y:bbox.minY},{x:cx-g,y:cy-g},{x:bbox.minX,y:cy-g}], [1,2,3], qScale));
+                    regions.push(R_([{x:cx+g,y:bbox.minY},{x:bbox.maxX,y:bbox.minY},{x:bbox.maxX,y:cy-g},{x:cx+g,y:cy-g}], [0,2,3], qScale));
+                    regions.push(R_([{x:cx+g,y:cy+g},{x:bbox.maxX,y:cy+g},{x:bbox.maxX,y:bbox.maxY},{x:cx+g,y:bbox.maxY}], [0,1,3], qScale));
+                    regions.push(R_([{x:bbox.minX,y:cy+g},{x:cx-g,y:cy+g},{x:cx-g,y:bbox.maxY},{x:bbox.minX,y:bbox.maxY}], [0,1,2], qScale));
                 }
             } else { // Full
                 regions.push(R_([
@@ -733,27 +801,29 @@ var px=0;var py=0;var pz=0;var prange=.1;
         for (var ri = 0; ri < regions.length; ri++) {
             var region = regions[ri].poly;
             var lockVerts = regions[ri].lockVerts;
+            var lockedScale = regions[ri].lockedScale || 0;
 
-            // Inset non-locked edges to define a consistent hull size. Locked
-            // edges (towers' aligned edge) stay flush with the frame.
-            // Inset scales with the region's short dimension so small regions
-            // (thin towers) don't collapse, with a floor of minOffset * 4.
+            // Two inset polygons:
+            //   - effRegion bounds interior site placement (so the outermost
+            //     sites are always the hull anchors, regardless of density).
+            //   - anchors live between region and effRegion, at jittered insets,
+            //     so the hull outline stays organic instead of rectilinear.
+            // Both scale with the region's short dimension so thin towers
+            // don't collapse; floor at minOffset*4.
             var rOuter = polygonBBox(region);
             var rShort = Math.min(rOuter.maxX - rOuter.minX, rOuter.maxY - rOuter.minY);
             var organicInset = Math.max(minOffset * 4, rShort * 0.1);
-            var effRegion = effectiveRegionFor(region, lockVerts, organicInset);
+            // Interior clip is inset further than anchors' average, so anchors
+            // stay on the hull even when interior sites spread out.
+            var effRegion = effectiveRegionFor(region, lockVerts, organicInset * 1.4, lockedScale);
             var rbbox = polygonBBox(effRegion);
 
             // Region's share of the global site budget, proportional to area.
             var interiorTarget = Math.max(4, Math.round(numSites * regionAreas[ri] / totalRegionArea));
 
-            // Lock every vertex of the inset region — this pins the triangulation's
-            // convex hull to a known, density-independent shape, so low-density
-            // outputs fill the same canvas area as high-density ones.
-            var sites = [];
-            for (var v = 0; v < effRegion.length; v++) {
-                sites.push({x: effRegion[v].x, y: effRegion[v].y, locked: true});
-            }
+            // Hull anchors — jittered positions + jittered insets give an
+            // irregular convex hull at ~consistent size across densities.
+            var sites = generateHullAnchors(region, lockVerts, organicInset, 2, lockedScale);
 
             // Rejection-sample interior sites inside the inset region.
             var attempts = 0;
@@ -800,9 +870,9 @@ var px=0;var py=0;var pz=0;var prange=.1;
                 // of sites overshoots. Then clip to the region for safety.
                 var centroidX0 = (triPoly[0].x + triPoly[1].x + triPoly[2].x) / 3;
                 var centroidY0 = (triPoly[0].y + triPoly[1].y + triPoly[2].y) / 3;
-                if (!pointInConvexPolygon({x: centroidX0, y: centroidY0}, effRegion)) continue;
+                if (!pointInConvexPolygon({x: centroidX0, y: centroidY0}, region)) continue;
 
-                var polygon = clipPolygonToConvex(triPoly, effRegion);
+                var polygon = clipPolygonToConvex(triPoly, region);
                 if (!polygon || polygon.length < 3) continue;
 
                 // Inradius via 2*area/perimeter (exact for triangles, reasonable
