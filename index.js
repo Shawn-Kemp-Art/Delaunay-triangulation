@@ -101,15 +101,26 @@ var qcolors = R.random_int(1,6);
 if(new URLSearchParams(window.location.search).get('c')){qcolors = new URLSearchParams(window.location.search).get('c')}; //number of colors
 var qsize = "2";
 if(new URLSearchParams(window.location.search).get('s')){qsize = new URLSearchParams(window.location.search).get('s')}; //size
+// Small URL override helper — reads ?key=value and returns null when absent.
+// Used both as slider defaults AND as hard overrides at the $fx.getParam sites
+// below, so e.g. ?d=10 forces density=10 regardless of what fxparams picked.
+function qParam(key) {
+    var v = new URLSearchParams(window.location.search).get(key);
+    return (v !== null && v !== '') ? v : null;
+}
+
 var qdensity = R.random_int(1,10);
-if(new URLSearchParams(window.location.search).get('d')){qdensity = new URLSearchParams(window.location.search).get('d')}; //density
+if(qParam('d') !== null){qdensity = parseInt(qParam('d'))}; //density
 qdensity = qdensity+3;
 var qvariation = 10;
-if(new URLSearchParams(window.location.search).get('v')){qvariation = parseInt(new URLSearchParams(window.location.search).get('v'))}; //cell size variation
-var qdepthvariation = 5;
-if(new URLSearchParams(window.location.search).get('dv')){qdepthvariation = parseInt(new URLSearchParams(window.location.search).get('dv'))}; //depth variation
+if(qParam('v') !== null){qvariation = parseInt(qParam('v'))}; //cell size variation
+var qdepthvariation = false;
+if(qParam('dv') !== null){
+    var _dv = qParam('dv').toLowerCase();
+    qdepthvariation = (_dv === '1' || _dv === 'true' || _dv === 'on' || _dv === 'yes');
+}; //depth variation (boolean)
 var qstyle = R.random_choice(["Full","Towers","Split"]);
-if(new URLSearchParams(window.location.search).get('st')){qstyle = new URLSearchParams(window.location.search).get('st')}; //style
+if(qParam('st') !== null){qstyle = qParam('st')}; //style
 
 var qorientation =R.random_int(1,2) < 2 ? "portrait" : "landscape";
 var qframecolor = R.random_int(0,3) < 1 ? "White" : R.random_int(1,3) < 2 ? "Mocha" : "Random";     
@@ -214,13 +225,8 @@ definitions = [
     {
         id: "depthvariation",
         name: "Depth variation",
-        type: "number",
+        type: "boolean",
         default: qdepthvariation,
-        options: {
-            min: 1,
-            max: 10,
-            step: 1,
-        },
     },
     {
         id: "style",
@@ -326,7 +332,7 @@ var px=0;var py=0;var pz=0;var prange=.1;
 //define the Delaunay triangulation (deterministic via $fx.rand)
         var drawareawide = wide-framewidth*2;
         var drawareahigh = high-framewidth*2;
-        var densityParam = $fx.getParam('density'); // 3..13
+        var densityParam = qParam('d') !== null ? parseInt(qParam('d')) : $fx.getParam('density'); // 3..13
         var avgCellSize = drawareawide / densityParam;
         var avgCellArea = avgCellSize * avgCellSize;
         // A Delaunay triangulation over N interior points produces ~2N triangles,
@@ -658,7 +664,7 @@ var px=0;var py=0;var pz=0;var prange=.1;
             return regions;
         }
 
-        var styleParam = $fx.getParam('style');
+        var styleParam = qParam('st') !== null ? qParam('st') : $fx.getParam('style');
         var regions = buildRegions(styleParam);
         console.log('Style: ' + styleParam + ' / regions: ' + regions.length);
 
@@ -670,18 +676,27 @@ var px=0;var py=0;var pz=0;var prange=.1;
         }
 
         // Shared driver knobs.
-        var variation = $fx.getParam('variation');
+        var variation = qParam('v') !== null ? parseInt(qParam('v')) : $fx.getParam('variation');
         var variationT = (variation - 1) / 9;
         var blend = 1.0 - variationT * 0.96;
         var relaxIters = 4;
 
-        var depthVariation = $fx.getParam('depthvariation');
-        var depthVarT = (depthVariation - 1) / 9;
+        var depthVariation = qParam('dv') !== null ? qdepthvariation : $fx.getParam('depthvariation');
+        var depthVarT = depthVariation ? 1 : 0; // boolean: full range vs uniform
         var firstVoronoiLayer = stacks - 1; // every layer participates in the triangulation
         var fullMaxDepth = firstVoronoiLayer;
-        var fullMinDepth = Math.min(5, fullMaxDepth);
-        var midDepth = (fullMinDepth + fullMaxDepth) / 2;
-        var halfRange = (fullMaxDepth - fullMinDepth) / 2 * depthVarT;
+        // Baseline depth is ~2/3 into the stack — preserves the look at dv=1.
+        // At dv=10, the range opens all the way to [1, firstVoronoiLayer] so
+        // some cells barely cut the top layer and others cut clean through.
+        var midDepth = Math.round(firstVoronoiLayer * 0.7);
+        if (midDepth < 2) midDepth = 2;
+        var halfRangeDown = (midDepth - 1) * depthVarT;
+        var halfRangeUp = (fullMaxDepth - midDepth) * depthVarT;
+        var minDepth = Math.max(1, Math.round(midDepth - halfRangeDown));
+        var maxDepth = Math.min(fullMaxDepth, Math.round(midDepth + halfRangeUp));
+        if (maxDepth < minDepth) maxDepth = minDepth;
+        console.log('Depth: dv=' + depthVariation + ' range=[' + minDepth + '..' + maxDepth + '] mid=' + midDepth);
+
 
         var cells = [];
 
@@ -768,8 +783,6 @@ var px=0;var py=0;var pz=0;var prange=.1;
                 var depthNoise = noise.get(centroid.x * prange * 0.6, centroid.y * prange * 0.6);
                 if (depthNoise < 0) depthNoise = 0;
                 if (depthNoise > 1) depthNoise = 1;
-                var minDepth = Math.max(1, Math.round(midDepth - halfRange));
-                var maxDepth = Math.max(minDepth, Math.round(midDepth + halfRange));
                 var depth = minDepth + Math.floor(depthNoise * (maxDepth - minDepth + 1));
                 if (depth > fullMaxDepth) depth = fullMaxDepth;
                 if (depth < 1) depth = 1;
