@@ -783,11 +783,10 @@ var px=0;var py=0;var pz=0;var prange=.1;
         var depthVarT = depthVariation ? 1 : 0; // boolean: full range vs uniform
         var firstVoronoiLayer = stacks - 1; // every layer participates in the triangulation
         var fullMaxDepth = firstVoronoiLayer;
-        // Baseline depth is ~2/3 into the stack — preserves the look at dv=1.
-        // At dv=10, the range opens all the way to [1, firstVoronoiLayer] so
-        // some cells barely cut the top layer and others cut clean through.
-        var midDepth = Math.round(firstVoronoiLayer * 0.7);
-        if (midDepth < 2) midDepth = 2;
+        // Full depth by default — cuts reach layer 1, only z=0 (the backing board)
+        // stays solid. depthVariation opens the range to [1, firstVoronoiLayer]
+        // so some cells cut all the way through and others are shallower.
+        var midDepth = firstVoronoiLayer;
         var halfRangeDown = (midDepth - 1) * depthVarT;
         var halfRangeUp = (fullMaxDepth - midDepth) * depthVarT;
         var minDepth = Math.max(1, Math.round(midDepth - halfRangeDown));
