@@ -159,7 +159,7 @@ definitions = [
         name: "Size",
         type: "select",
         default: qsize,
-        options: {options: ["1", "2", "3"]},
+        options: {options: ["1", "2", "3","4","5","6"]},
     },
     {
         id: "colors",
