@@ -916,6 +916,11 @@ paper.view.autoUpdate = false;
 
 //---- Draw the Layers
 
+// Warm-up: force paper.js to yield/render once before the first real Clipper
+// boolean op, so the first op (the bottom layer's frame) isn't the cold one
+// that silently returns empty (which dropped a layer, e.g. 11 instead of 12).
+paper.view.update();
+await new Promise(resolve => setTimeout(resolve, 0));
 
 for (z = 0; z < stacks; z++) {
     pz=z*prange;
