@@ -101,6 +101,10 @@ var qcolors = R.random_int(1,6);
 if(new URLSearchParams(window.location.search).get('c')){qcolors = new URLSearchParams(window.location.search).get('c')}; //number of colors
 var qsize = "2";
 if(new URLSearchParams(window.location.search).get('s')){qsize = new URLSearchParams(window.location.search).get('s')}; //size
+
+var qaspect = "4:5";
+if(new URLSearchParams(window.location.search).get('aspect')){qaspect = new URLSearchParams(window.location.search).get('aspect')}; //aspect ratio
+
 // Small URL override helper — reads ?key=value and returns null when absent.
 // Used both as slider defaults AND as hard overrides at the $fx.getParam sites
 // below, so e.g. ?d=10 forces density=10 regardless of what fxparams picked.
@@ -151,7 +155,7 @@ definitions = [
         id: "aspectratio",
         name: "Aspect ratio",
         type: "select",
-        default: "4:5",
+        default: qaspect,
         options: {options: ["1:1", "2:5","3:5","4:5","54:86","296:420"]},
     },
     {
